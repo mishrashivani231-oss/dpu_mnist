@@ -1,163 +1,87 @@
-
+#!/usr/bin/env python3
+import os, time, argparse
 import numpy as np
-from ctypes import *
-from typing import List
-import cv2
-import numpy as np
-import vart
-import os
-import pathlib
-import xir
-import threading
-import time
-import sys
-import argparse
+from PIL import Image, ImageOps
+import xir, vart
 
+def dpu_subgraph(graph):
+    root = graph.get_root_subgraph()
+    subs = [s for s in root.toposort_child_subgraph()
+            if s.has_attr("device") and s.get_attr("device").upper()=="DPU"]
+    assert len(subs)==1, "Expected exactly 1 DPU subgraph"
+    return subs[0]
 
-# In[ ]:
-
-
-def get_child_subgraph_dpu(graph: "Graph") -> List["Subgraph"]:
-    assert graph is not None, "'graph' should not be None."
-    root_subgraph = graph.get_root_subgraph()
-    assert (root_subgraph is not None), "Failed to get root subgraph of input Graph object."
-    if root_subgraph.is_leaf:
-        return []
-    child_subgraphs = root_subgraph.toposort_child_subgraph()
-    assert child_subgraphs is not None and len(child_subgraphs) > 0
-    return [
-        cs
-        for cs in child_subgraphs
-        if cs.has_attr("device") and cs.get_attr("device").upper() == "DPU"
-    ]
-
-
-import numpy as np
-from ctypes import *
-from typing import List
-import cv2
-import numpy as np
-import vart
-import os
-import pathlib
-import xir
-import threading
-import time
-import sys
-import argparse
-
-
-# In[ ]:
-
-
-def get_child_subgraph_dpu(graph: "Graph") -> List["Subgraph"]:
-    assert graph is not None, "'graph' should not be None."
-    root_subgraph = graph.get_root_subgraph()
-    assert (root_subgraph is not None), "Failed to get root subgraph of input Graph object."
-    if root_subgraph.is_leaf:
-        return []
-    child_subgraphs = root_subgraph.toposort_child_subgraph()
-    assert child_subgraphs is not None and len(child_subgraphs) > 0
-    return [
-        cs
-        for cs in child_subgraphs
-        if cs.has_attr("device") and cs.get_attr("device").upper() == "DPU"
-    ]
-
-
-# In[ ]:
-
-
-def runDPU(id,start,dpu,img):
-    '''get tensor'''
-    inputTensors = dpu.get_input_tensors()
-    outputTensors = dpu.get_output_tensors()
-    input_ndim = tuple(inputTensors[0].dims)
-    output_ndim = tuple(outputTensors[0].dims)
-
-    # we can avoid output scaling if use argmax instead of softmax
-    #output_fixpos = outputTensors[0].get_attr("fix_point")
-    #output_scale = 1 / (2**output_fixpos)
-
-    batchSize = input_ndim[0]
-    n_of_images = len(img)
-    count = 0
-    write_index = start
-    ids=[]
-    ids_max = 50
-    outputData = []
-    for i in range(ids_max):
-        outputData.append([np.empty(output_ndim, dtype=np.int8, order="C")])
-    while count < n_of_images:
-        if (count+batchSize<=n_of_images):
-            runSize = batchSize
-        else:
-            runSize=n_of_images-count
-
-        '''prepare batch input/output '''
-        inputData = []
-        inputData = [np.empty(input_ndim, dtype=np.int8, order="C")]
-
-        '''init input image to input buffer '''
-        '''run with batch '''
-        job_id = dpu.execute_async(inputData,outputData[len(ids)])
-        ids.append((job_id,runSize,start+count))
-        count = count + runSize
-        if count<n_of_images:
-            if len(ids) < ids_max-1:
-                continue
-        ids=[]
-
-
-# In[ ]:
-
-
-divider = '------------------------------------'
-
-runTotal = 100
-threads = 2
-
-model= "deploy.xmodel"
-out_q = [None] * runTotal
-g = xir.Graph.deserialize(model)
-subgraphs = get_child_subgraph_dpu(g)
-all_dpu_runners = []
-
-for i in range(threads):
-    all_dpu_runners.append(vart.Runner.create_runner(subgraphs[0], "run"))
-
-input_fixpos = all_dpu_runners[0].get_input_tensors()[0].get_attr("fix_point")
-input_scale = 2**input_fixpos
-
-image = np.random.rand(28,28,1)
-image = image * input_scale
-image = image.astype(np.int8)
-
-img = []
-for i in range(runTotal):
-    img.append(image[i])
-
-threadAll = []
-start=0
-for i in range(threads):
-    if (i==threads-1):
-        end = len(img)
+def load28(img_path):
+    """Return float32 image in [0,1] shaped (28,28). If no path, return zeros."""
+    if img_path and os.path.isfile(img_path):
+        img = Image.open(img_path).convert("L")
+        # If the digit is dark on light background, invert so foreground is bright
+        if np.asarray(img).mean() < 127: img = ImageOps.invert(img)
+        img = img.resize((28,28))
+        arr = np.asarray(img, dtype=np.float32)/255.0
     else:
-        end = start+(len(img)//threads)
-    in_q = img[start:end]
-    t1 = threading.Thread(target=runDPU, args=(i,start,all_dpu_runners[i], in_q))
-    threadAll.append(t1)
-    start=end
+        arr = np.zeros((28,28), dtype=np.float32)  # black image as fallback
+    return arr
 
-time1 = time.time()
-for x in threadAll:
-    x.start()
-for x in threadAll:
-    x.join()
-time2 = time.time()
-timetotal = time2 - time1
+def to_dpu_dtype(x, it):
+    """Quantize to int8 if required by input tensor dtype."""
+    if "INT8" in str(it.dtype).upper():
+        fix = it.get_attr("fix_point") if it.has_attr("fix_point") else 7
+        return np.clip(np.round(x*(1<<fix)), -128, 127).astype(np.int8)
+    return x.astype(np.float32)
 
-fps = float(runTotal / timetotal)
-print (divider)
-print("Throughput=%.2f fps, total frames = %.0f, time=%.4f seconds" %(fps, runTotal, timetotal))
-                                                                                                                                                                         
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="deploy.xmodel")
+    ap.add_argument("--image", default=None, help="28x28 grayscale PNG (optional)")
+    ap.add_argument("--loops", type=int, default=100, help="number of inferences")
+    args = ap.parse_args()
+
+    assert os.path.isfile(args.model), f"Model not found: {args.model}"
+    g = xir.Graph.deserialize(args.model)
+    r = vart.Runner.create_runner(dpu_subgraph(g), "run")
+
+    it = r.get_input_tensors()[0]
+    ot = r.get_output_tensors()[0]
+    ib_shape = tuple(it.dims)
+    ob_shape = tuple(ot.dims)
+
+    # Prepare one input sample
+    x = load28(args.image)  # (28,28) float32 in [0,1]
+    # NHWC vs NCHW
+    if ib_shape[-1] == 1:
+        x = x.reshape(1,28,28,1)
+    else:
+        x = x.reshape(1,1,28,28)
+    x = to_dpu_dtype(x, it)
+
+    # Allocate buffers once
+    ib = [np.empty(ib_shape, dtype=x.dtype)]
+    ob = [np.empty(ob_shape, dtype=np.int8 if "INT8" in str(ot.dtype).upper() else np.float32)]
+
+    # Warmup
+    np.copyto(ib[0], x)
+    jid = r.execute_async(ib, ob); r.wait(jid)
+
+    # Timed loop
+    t0 = time.time()
+    for _ in range(args.loops):
+        np.copyto(ib[0], x)
+        jid = r.execute_async(ib, ob)
+        r.wait(jid)
+    dt = time.time() - t0
+    fps = args.loops / dt if dt > 0 else float("inf")
+
+    # Decode a single result to show correctness
+    y = ob[0].reshape(-1)
+    if "INT8" in str(ot.dtype).upper():
+        fix = ot.get_attr("fix_point") if ot.has_attr("fix_point") else 7
+        y = y.astype(np.float32) / (1 << fix)
+    pred = int(np.argmax(y))
+
+    print("------------------------------------")
+    print(f"Predicted digit: {pred}")
+    print(f"Throughput: {fps:.2f} FPS  |  loops: {args.loops}  |  time: {dt:.4f} s")
+
+if __name__ == "__main__":
+    main()
