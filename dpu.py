@@ -29,7 +29,7 @@ def get_child_subgraph_dpu(graph: "Graph") -> List["Subgraph"]:
         cs
         for cs in child_subgraphs
         if cs.has_attr("device") and cs.get_attr("device").upper() == "DPU"
-
+    ]
 
 
 import numpy as np
