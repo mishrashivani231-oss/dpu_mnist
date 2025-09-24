@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-import os, time, argparse
+import os, time, argparse, subprocess
 import numpy as np
 from PIL import Image, ImageOps
 import xir, vart
 
-def dpu_subgraph(graph):
+def get_dpu_subgraphs(graph):
+    """Return all DPU subgraphs (sorted largest-first)."""
     root = graph.get_root_subgraph()
-    subs = [s for s in root.toposort_child_subgraph()
-            if s.has_attr("device") and s.get_attr("device").upper()=="DPU"]
-    assert len(subs)==1, "Expected exactly 1 DPU subgraph"
-    return subs[0]
+    out = []
+    def walk(sg):
+        if sg.has_attr("device") and str(sg.get_attr("device")).upper() == "DPU":
+            out.append(sg)
+        for c in sg.children:
+            walk(c)
+    walk(root)
+    try:
+        out.sort(key=lambda s: len(s.get_ops()), reverse=True)
+    except Exception:
+        pass
+    return out
 
 def load28(img_path):
     """Return float32 image in [0,1] shaped (28,28). If no path, return zeros."""
@@ -20,7 +29,7 @@ def load28(img_path):
         img = img.resize((28,28))
         arr = np.asarray(img, dtype=np.float32)/255.0
     else:
-        arr = np.zeros((28,28), dtype=np.float32)  # black image as fallback
+        arr = np.zeros((28,28), dtype=np.float32)
     return arr
 
 def to_dpu_dtype(x, it):
@@ -35,11 +44,33 @@ def main():
     ap.add_argument("--model", default="mnist_int8_b4096.xmodel")
     ap.add_argument("--image", default=None, help="28x28 grayscale PNG (optional)")
     ap.add_argument("--loops", type=int, default=100, help="number of inferences")
+    ap.add_argument("--subgraph-index", type=int, default=0,
+                    help="which DPU subgraph to run if multiple are present (default: largest=0)")
     args = ap.parse_args()
 
-    assert os.path.isfile(args.model), f"Model not found: {args.model}"
+    if not os.path.isfile(args.model):
+        raise FileNotFoundError(f"Model not found: {args.model}")
+
+    # Optional: print the model fingerprint for sanity
+    try:
+        out = subprocess.check_output(["xdputil", "xmodel", "-t", args.model], text=True)
+        for line in out.splitlines():
+            if "fingerprint" in line.lower():
+                print(line.strip())
+                break
+    except Exception:
+        pass
+
     g = xir.Graph.deserialize(args.model)
-    r = vart.Runner.create_runner(dpu_subgraph(g), "run")
+    dpu_subs = get_dpu_subgraphs(g)
+    if not dpu_subs:
+        raise RuntimeError("No DPU subgraph found in xmodel")
+    if args.subgraph_index < 0 or args.subgraph_index >= len(dpu_subs):
+        raise IndexError(f"--subgraph-index {args.subgraph_index} out of range (found {len(dpu_subs)} DPU subgraphs)")
+
+    sg = dpu_subs[args.subgraph_index]
+    print(f"Using DPU subgraph: {sg.get_name()}  (index {args.subgraph_index} / total {len(dpu_subs)})")
+    r = vart.Runner.create_runner(sg, "run")
 
     it = r.get_input_tensors()[0]
     ot = r.get_output_tensors()[0]
