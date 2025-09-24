@@ -32,7 +32,7 @@ def to_dpu_dtype(x, it):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="mnist_int8.xmodel")
+    ap.add_argument("--model", default="mnist_int8_b4096.xmodel")
     ap.add_argument("--image", default=None, help="28x28 grayscale PNG (optional)")
     ap.add_argument("--loops", type=int, default=100, help="number of inferences")
     args = ap.parse_args()
